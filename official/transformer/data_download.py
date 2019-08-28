@@ -30,6 +30,11 @@ from absl import flags
 import tensorflow as tf
 # pylint: enable=g-bad-import-order
 
+#append tensorflow-models path to the PYTHONPATH
+import sys
+sys.path.append('/mnt/output/home/tensorflow-models')
+
+
 from official.transformer.utils import tokenizer
 from official.utils.flags import core as flags_core
 

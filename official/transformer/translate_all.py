@@ -20,19 +20,22 @@ from __future__ import print_function
 
 import os
 
+#append tensorflow-models path to the PYTHONPATH
+import sys
+sys.path.append('/mnt/output/home/tensorflow-models')
+
+
 # pylint: disable=g-bad-import-order
 from absl import app as absl_app
 from absl import flags
 import tensorflow as tf
 # pylint: enable=g-bad-import-order
 
-#append tensorflow-models path to the PYTHONPATH
-import sys
-sys.path.append('/mnt/output/home/tensorflow-models')
-
-
 from official.transformer.utils import tokenizer
 from official.utils.flags import core as flags_core
+
+from official.transformer import checkpoint_yield
+import time
 
 _DECODE_BATCH_SIZE = 32
 _EXTRA_DECODE_LENGTH = 100
@@ -49,9 +52,17 @@ def _get_sorted_inputs(filename):
     Sorted list of inputs, and dictionary mapping original index->sorted index
     of each element.
   """
+  
+  # added to get the total number of words for metrics
+
+  global total_words
+
   with tf.gfile.Open(filename) as f:
     records = f.read().split("\n")
     inputs = [record.strip() for record in records]
+    num_words = [len(sentence.split()) for sentence in records]
+    total_words = sum(num_words)
+    tf.logging.info("Total number of words: %d"%total_words)
     if not inputs[-1]:
       inputs.pop()
 
@@ -81,11 +92,12 @@ def _trim_and_decode(ids, subtokenizer):
 
 
 def translate_file(
-    estimator, subtokenizer, input_file, output_file=None,
+    checkpoint_path, estimator, subtokenizer, input_file, output_file=None,
     print_all_translations=True):
   """Translate lines in file, and save to output file if specified.
 
   Args:
+    checkpoint_path: path of the specific checkpoint to predict.
     estimator: tf.Estimator used to generate the translations.
     subtokenizer: Subtokenizer object for encoding and decoding source and
        translated lines.
@@ -121,13 +133,22 @@ def translate_file(
     return ds
 
   translations = []
-  for i, prediction in enumerate(estimator.predict(input_fn)):
+  start_time=time.time()
+  for i, prediction in enumerate(estimator.predict(input_fn, checkpoint_path=checkpoint_path)):
     translation = _trim_and_decode(prediction["outputs"], subtokenizer)
     translations.append(translation)
 
     if print_all_translations:
       tf.logging.info("Translating:\n\tInput: %s\n\tOutput: %s" %
                       (sorted_inputs[i], translation))
+  
+  end_time=time.time()
+  elapsed_time=end_time-start_time
+
+  tf.logging.info("Elapsed Time for all predictions: %5.5f"%(elapsed_time))
+  tf.logging.info("No of Sentences per Second: %f"%(len(translations)/elapsed_time))
+  tf.logging.info("No of Words per second: %f"%(total_words/elapsed_time))
+
 
   # Write translations in the order they appeared in the original file.
   if output_file is not None:
@@ -156,7 +177,8 @@ def translate_text(estimator, subtokenizer, txt):
 
 
 def main(unused_argv):
-  from official.transformer import transformer_main
+  # changed to import transformer_main_hvd instead of transformer_main
+  from official.transformer import transformer_main_hvd
 
   tf.logging.set_verbosity(tf.logging.INFO)
 
@@ -168,14 +190,20 @@ def main(unused_argv):
   subtokenizer = tokenizer.Subtokenizer(FLAGS.vocab_file)
 
   # Set up estimator and params
-  params = transformer_main.PARAMS_MAP[FLAGS.param_set]
+  params = transformer_main_hvd.PARAMS_MAP[FLAGS.param_set]
   params["beam_size"] = _BEAM_SIZE
   params["alpha"] = _ALPHA
   params["extra_decode_length"] = _EXTRA_DECODE_LENGTH
   params["batch_size"] = _DECODE_BATCH_SIZE
   estimator = tf.estimator.Estimator(
-      model_fn=transformer_main.model_fn, model_dir=FLAGS.model_dir,
-      params=params)
+      model_fn=transformer_main_hvd.model_fn, model_dir=FLAGS.model_dir,
+      params=params,
+      config=tf.estimator.RunConfig(session_config=tf.ConfigProto(intra_op_parallelism_threads=FLAGS.intra_op, 
+inter_op_parallelism_threads=FLAGS.inter_op)))
+
+  # create translation directory
+
+  tf.gfile.MakeDirs(FLAGS.translations_dir)
 
   if FLAGS.text is not None:
     tf.logging.info("Translating text: %s" % FLAGS.text)
@@ -187,12 +215,18 @@ def main(unused_argv):
     if not tf.gfile.Exists(FLAGS.file):
       raise ValueError("File does not exist: %s" % input_file)
 
-    output_file = None
+    """ output_file = None
     if FLAGS.file_out is not None:
       output_file = os.path.abspath(FLAGS.file_out)
-      tf.logging.info("File output specified: %s" % output_file)
+      tf.logging.info("File output specified: %s" % output_file) """
 
-    translate_file(estimator, subtokenizer, input_file, output_file)
+    for model in checkpoint_yield.stepfiles_iterator(FLAGS.model_dir, wait_minutes=FLAGS.wait_minutes, min_steps=FLAGS.min_steps):
+      
+      checkpoint_path, checkpoint_file=os.path.split(model[0])
+      output_file = os.path.abspath(FLAGS.translations_dir+"/"+checkpoint_file+"_"+FLAGS.file_out)
+      tf.logging.info("Output file: %s" % output_file)
+
+      translate_file(model[0], estimator, subtokenizer, input_file, output_file)
 
 
 def define_translate_flags():
@@ -233,6 +267,22 @@ def define_translate_flags():
       name="file_out", default=None,
       help=flags_core.help_wrap(
           "If --file flag is specified, save translation to this file."))
+  # added to support the translate all functionality
+  flags.DEFINE_string(name="translations_dir", default="translations",
+                    help=flags_core.help_wrap("Where to store the translated files."))
+  flags.DEFINE_integer(name="min_steps", default=0, help=flags_core.help_wrap("Ignore checkpoints with less steps."))
+  flags.DEFINE_integer(name="wait_minutes", default=0,
+                     help=flags_core.help_wrap("Wait upto N minutes for a new checkpoint"))
+
+  # add intra_op and inter_op flags as arguments
+
+  flags.DEFINE_integer(
+     name="intra_op", default=None,
+     help=flags_core.help_wrap("The number of intra_op_parallelism threads"))
+  flags.DEFINE_integer(
+     name="inter_op", default=None,
+     help=flags_core.help_wrap("The number of inter_op_parallelism threads"))
+
 
 
 if __name__ == "__main__":
